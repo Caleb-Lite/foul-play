@@ -4,6 +4,7 @@ dist/
 .idea/
 **/actual_states/*
 **/__pycache__/*
+.env
 creds
 *.xlsx
 *.txt

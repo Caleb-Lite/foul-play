@@ -98,7 +98,16 @@ def display_move_suggestion(battle, best_move_formatted):
 
     # Display the suggestion
     logger.info("")
-    logger.info("RECOMMENDED ACTION: {}".format(best_move_formatted[0]))
+    recommended_action = best_move_formatted[0]
+    if recommended_action.startswith("/switch"):
+        switch_index = int(recommended_action.split()[1])
+        if battle.request_json and battle.request_json.get(constants.SIDE):
+            pokemon_list = battle.request_json[constants.SIDE][constants.POKEMON]
+            if switch_index - 1 < len(pokemon_list):
+                pokemon_details = pokemon_list[switch_index - 1][constants.DETAILS]
+                pokemon_name = pokemon_details.split(",")[0]
+                recommended_action = "{} ({})".format(recommended_action, pokemon_name)
+    logger.info("RECOMMENDED ACTION: {}".format(recommended_action))
     logger.info("")
 
     # Display available moves for reference
@@ -108,14 +117,14 @@ def display_move_suggestion(battle, best_move_formatted):
             moves = battle.request_json[constants.ACTIVE][0].get(constants.MOVES, [])
             for i, move in enumerate(moves, 1):
                 disabled = " (DISABLED)" if move.get(constants.DISABLED) else ""
-                pp_info = " - PP: {}/{}".format(move.get(constants.PP, 0), move.get(constants.MAXPP, 0))
+                pp_info = " - PP: {}/{}".format(move.get(constants.PP, 0), move.get("maxpp", 0))
                 logger.info("  {}. {}{}{}".format(i, move[constants.ID], pp_info, disabled))
 
         # Display available switches
         if battle.request_json.get(constants.SIDE):
             alive_reserves = [
                 p for p in battle.request_json[constants.SIDE][constants.POKEMON][1:]
-                if not p.get(constants.FAINTED, False)
+                if " fnt" not in p.get(constants.CONDITION, "")
             ]
             if alive_reserves:
                 logger.info("")
@@ -281,7 +290,10 @@ async def start_random_battle(
     process_battle_updates(battle)
 
     best_move = await async_pick_move(battle)
-    await ps_websocket_client.send_message(battle.battle_tag, best_move)
+    if FoulPlayConfig.manual_mode:
+        display_move_suggestion(battle, best_move)
+    else:
+        await ps_websocket_client.send_message(battle.battle_tag, best_move)
 
     return battle
 
@@ -326,7 +338,10 @@ async def start_standard_battle(
         process_battle_updates(battle)
 
         best_move = await async_pick_move(battle)
-        await ps_websocket_client.send_message(battle.battle_tag, best_move)
+        if FoulPlayConfig.manual_mode:
+            display_move_suggestion(battle, best_move)
+        else:
+            await ps_websocket_client.send_message(battle.battle_tag, best_move)
 
     else:
         while constants.START_TEAM_PREVIEW not in msg:
@@ -417,13 +432,21 @@ async def pokemon_battle(ps_websocket_client, pokemon_battle_type, team_dict):
             await ps_websocket_client.leave_battle(battle.battle_tag)
             return winner
         else:
-            action_required = await async_update_battle(battle, msg)
-            if action_required and not battle.wait:
-                best_move = await async_pick_move(battle)
+            logger.debug(f"Received msg starting with: {msg[:50]}...")
+            if msg.startswith(f">{battle.battle_tag}"):
+                logger.info("Message passed battle tag filter")
+                action_required = await async_update_battle(battle, msg)
+                logger.info(f"update_battle returned action_required={action_required}")
+                if action_required:
+                    logger.info(f"Action required - battle.wait={battle.wait}, will_calculate={not battle.wait}")
+                if action_required and not battle.wait:
+                    best_move = await async_pick_move(battle)
 
-                if FoulPlayConfig.manual_mode:
-                    # In manual mode, display the suggestion but don't execute
-                    display_move_suggestion(battle, best_move)
-                else:
-                    # In auto mode, execute the move
-                    await ps_websocket_client.send_message(battle.battle_tag, best_move)
+                    if FoulPlayConfig.manual_mode:
+                        # In manual mode, display the suggestion but don't execute
+                        display_move_suggestion(battle, best_move)
+                    else:
+                        # In auto mode, execute the move
+                        await ps_websocket_client.send_message(battle.battle_tag, best_move)
+            else:
+                logger.debug(f"Message FAILED battle tag filter. Expected: >{battle.battle_tag}, Got: {msg[:80]}")

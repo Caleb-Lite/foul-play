@@ -6,6 +6,8 @@ from enum import Enum, auto
 from logging.handlers import RotatingFileHandler
 from typing import Optional
 
+from dotenv import load_dotenv
+
 
 class CustomFormatter(logging.Formatter):
     def format(self, record):
@@ -85,80 +87,98 @@ class _FoulPlayConfig:
     file_log_handler: Optional[CustomRotatingFileHandler]
 
     def configure(self):
+        # Load environment variables from .env file
+        load_dotenv()
+
         parser = argparse.ArgumentParser()
         parser.add_argument(
             "--websocket-uri",
-            required=True,
+            default=os.getenv("WEBSOCKET_URI"),
             help="The PokemonShowdown websocket URI, e.g. wss://sim3.psim.us/showdown/websocket",
         )
-        parser.add_argument("--ps-username", required=True)
-        parser.add_argument("--ps-password", required=True)
-        parser.add_argument("--ps-avatar", default=None)
+        parser.add_argument("--ps-username", default=os.getenv("PS_USERNAME"))
+        parser.add_argument("--ps-password", default=os.getenv("PS_PASSWORD"))
+        parser.add_argument("--ps-avatar", default=os.getenv("PS_AVATAR"))
         parser.add_argument(
-            "--bot-mode", required=True, choices=[e.name for e in BotModes]
+            "--bot-mode", default=os.getenv("BOT_MODE"), choices=[e.name for e in BotModes]
         )
         parser.add_argument(
             "--user-to-challenge",
-            default=None,
+            default=os.getenv("USER_TO_CHALLENGE"),
             help="If bot_mode is `challenge_user`, this is required",
         )
         parser.add_argument(
-            "--pokemon-format", required=True, help="e.g. gen9randombattle"
+            "--pokemon-format", default=os.getenv("POKEMON_FORMAT"), help="e.g. gen9randombattle"
         )
         parser.add_argument(
             "--smogon-stats-format",
-            default=None,
+            default=os.getenv("SMOGON_STATS_FORMAT"),
             help="Overwrite which smogon stats are used to infer unknowns. If not set, defaults to the --pokemon-format value.",
         )
         parser.add_argument(
             "--search-time-ms",
             type=int,
-            default=100,
+            default=int(os.getenv("SEARCH_TIME_MS", "100")),
             help="Time to search per battle in milliseconds",
         )
         parser.add_argument(
             "--search-parallelism",
             type=int,
-            default=1,
+            default=int(os.getenv("SEARCH_PARALLELISM", "1")),
             help="Number of states to search in parallel",
         )
         parser.add_argument(
             "--run-count",
             type=int,
-            default=1,
+            default=int(os.getenv("RUN_COUNT", "1")),
             help="Number of PokemonShowdown battles to run",
         )
         parser.add_argument(
             "--team-name",
-            default=None,
+            default=os.getenv("TEAM_NAME"),
             help="Which team to use. Can be a filename or a foldername relative to ./teams/teams/. "
             "If a foldername, a random team from that folder will be chosen each battle. "
             "If not set, defaults to the --pokemon-format value.",
         )
         parser.add_argument(
             "--save-replay",
-            default="never",
+            default=os.getenv("SAVE_REPLAY", "never"),
             choices=[e.name for e in SaveReplay],
             help="When to save replays",
         )
         parser.add_argument(
             "--room-name",
-            default=None,
+            default=os.getenv("ROOM_NAME"),
             help="If bot_mode is `accept_challenge`, the room to join while waiting",
         )
-        parser.add_argument("--log-level", default="DEBUG", help="Python logging level")
+        parser.add_argument("--log-level", default=os.getenv("LOG_LEVEL", "DEBUG"), help="Python logging level")
         parser.add_argument(
             "--log-to-file",
             action="store_true",
+            default=os.getenv("LOG_TO_FILE", "").lower() in ("true", "1", "yes"),
             help="When enabled, DEBUG logs will be written to a file in the logs/ directory",
         )
         parser.add_argument(
             "--manual-mode",
             action="store_true",
+            default=os.getenv("MANUAL_MODE", "").lower() in ("true", "1", "yes"),
             help="When enabled, the bot will suggest moves but not execute them. You make moves in Pokemon Showdown directly.",
         )
 
         args = parser.parse_args()
+
+        # Validate required parameters
+        if not args.websocket_uri:
+            parser.error("--websocket-uri is required (or set WEBSOCKET_URI environment variable)")
+        if not args.ps_username:
+            parser.error("--ps-username is required (or set PS_USERNAME environment variable)")
+        if not args.ps_password:
+            parser.error("--ps-password is required (or set PS_PASSWORD environment variable)")
+        if not args.bot_mode:
+            parser.error("--bot-mode is required (or set BOT_MODE environment variable)")
+        if not args.pokemon_format:
+            parser.error("--pokemon-format is required (or set POKEMON_FORMAT environment variable)")
+
         self.websocket_uri = args.websocket_uri
         self.username = args.ps_username
         self.password = args.ps_password

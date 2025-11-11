@@ -204,6 +204,8 @@ class Battler:
         self.last_selected_move = LastUsedMove("", "", 0)
         self.last_used_move = LastUsedMove("", "", 0)
 
+        self.observed_behaviors = {}
+
     def possible_mega_evolutions(self):
         result = {}
         for pkmn in self.reserve + [self.active]:

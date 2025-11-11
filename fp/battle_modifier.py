@@ -211,8 +211,10 @@ def request(battle, split_msg):
 
         if battle_json.get(constants.WAIT):
             battle.wait = True
+            logger.info("Request received - wait flag: TRUE (will NOT calculate move)")
         else:
             battle.wait = False
+            logger.info("Request received - wait flag: FALSE (will calculate move if action required)")
 
         battle.request_json = battle_json
 
@@ -632,11 +634,35 @@ def heal_or_damage(battle, split_msg):
                 split_msg[2]
             )
             pkmn = side.find_reserve_pokemon_by_nickname(nickname)
+
+        old_hp = pkmn.hp
         if constants.FNT in split_msg[3]:
             pkmn.hp = 0
         else:
             pkmn.hp = float(split_msg[3].split("/")[0])
             pkmn.max_hp = float(split_msg[3].split("/")[1].split()[0])
+
+        if split_msg[1] == "-damage" and old_hp > 0 and pkmn.max_hp > 0 and pkmn.hp > 0:
+            damage = old_hp - pkmn.hp
+            damage_percentage = damage / pkmn.max_hp
+
+            if damage_percentage > 0.3 and other_side.last_used_move.move:
+                try:
+                    move_data = all_move_json[other_side.last_used_move.move]
+                    category = move_data.get(constants.CATEGORY)
+
+                    if category == 'physical':
+                        other_side.observed_behaviors['survived_strong_physical'] = True
+                        logger.debug("User survived strong physical hit from {} ({:.1f}% damage)".format(
+                            other_side.last_used_move.move, damage_percentage * 100
+                        ))
+                    elif category == 'special':
+                        other_side.observed_behaviors['survived_strong_special'] = True
+                        logger.debug("User survived strong special hit from {} ({:.1f}% damage)".format(
+                            other_side.last_used_move.move, damage_percentage * 100
+                        ))
+                except KeyError:
+                    pass
 
     # increase the amount of turns toxic has been active
     if (
@@ -998,6 +1024,15 @@ def move(battle, split_msg):
     try:
         category = all_move_json[move_name][constants.CATEGORY]
         logger.info("Setting {}'s last used move: {}".format(pkmn.name, move_name))
+
+        if is_opponent(battle, split_msg):
+            if category == 'physical':
+                side.observed_behaviors['used_physical_move'] = True
+                logger.debug("Opponent used physical move: {}".format(move_name))
+            elif category == 'special':
+                side.observed_behaviors['used_special_move'] = True
+                logger.debug("Opponent used special move: {}".format(move_name))
+
         if not any(
             "[from]move: Sleep Talk" in msg or "[from]Sleep Talk" in msg
             for msg in split_msg

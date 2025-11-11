@@ -197,6 +197,68 @@ def adjust_probabilities_for_sampling(move_rates, num_moves=4):
     return adjusted_rates
 
 
+def apply_context_filters(
+    pokemon_sets: list[PokemonSet], observed_behaviors: dict
+) -> list[PokemonSet]:
+    if not observed_behaviors:
+        return pokemon_sets
+
+    filtered_sets = []
+    total_adjustments = 0
+
+    for pkmn_set in pokemon_sets:
+        weight = pkmn_set.count
+        original_weight = weight
+
+        if observed_behaviors.get('used_special_move'):
+            if pkmn_set.evs.get('atk', 85) > pkmn_set.evs.get('spa', 85) + 50:
+                weight *= 0.3
+                logger.debug("Downweighting physical set due to special move observation")
+
+        if observed_behaviors.get('used_physical_move'):
+            if pkmn_set.evs.get('spa', 85) > pkmn_set.evs.get('atk', 85) + 50:
+                weight *= 0.3
+                logger.debug("Downweighting special set due to physical move observation")
+
+        if observed_behaviors.get('survived_strong_physical'):
+            if pkmn_set.evs.get('def', 85) < 100:
+                weight *= 0.4
+                logger.debug("Downweighting frail set - survived strong physical hit")
+
+        if observed_behaviors.get('survived_strong_special'):
+            if pkmn_set.evs.get('spd', 85) < 100:
+                weight *= 0.4
+                logger.debug("Downweighting specially frail set - survived strong special hit")
+
+        if observed_behaviors.get('outsped_benchmark'):
+            if pkmn_set.item == 'choicescarf':
+                weight *= 2.0
+                logger.debug("Boosting scarf set - outsped benchmark")
+            elif pkmn_set.evs.get('spe', 85) > 200:
+                weight *= 1.5
+                logger.debug("Boosting fast set - outsped benchmark")
+
+        if observed_behaviors.get('was_outsped'):
+            if pkmn_set.item == 'choicescarf':
+                weight *= 0.3
+                logger.debug("Downweighting scarf set - was outsped")
+            elif pkmn_set.evs.get('spe', 85) > 200:
+                weight *= 0.5
+                logger.debug("Downweighting fast set - was outsped")
+
+        if weight != original_weight:
+            total_adjustments += 1
+
+        new_set = deepcopy(pkmn_set)
+        new_set.count = max(1, weight)
+        filtered_sets.append(new_set)
+
+    if total_adjustments > 0:
+        logger.info("Applied context filters: adjusted {} set probabilities".format(total_adjustments))
+
+    return filtered_sets
+
+
 def get_filtered_sets(
     pkmn: Pokemon, remaining_sets: list[PokemonSet]
 ) -> list[PokemonSet]:
@@ -303,21 +365,27 @@ def set_most_likely_hidden_power(pkmn: Pokemon):
                 break
 
 
-def sample_pokemon(pkmn: Pokemon):
+def sample_pokemon(pkmn: Pokemon, observed_behaviors: dict = None):
+    if observed_behaviors is None:
+        observed_behaviors = {}
+
     if not pkmn.mega_name:
-        _sample_pokemon(pkmn)
+        _sample_pokemon(pkmn, observed_behaviors)
         return
 
     # the ability of a mega pokemon that has not yet mega-evolved
     # needs to be sampled from its non-mega version
     pkmn_without_mega = deepcopy(pkmn)
     pkmn_without_mega.mega_name = None
-    _sample_pokemon(pkmn_without_mega)
+    _sample_pokemon(pkmn_without_mega, observed_behaviors)
     pkmn.ability = pkmn_without_mega.ability
-    _sample_pokemon(pkmn)
+    _sample_pokemon(pkmn, observed_behaviors)
 
 
-def _sample_pokemon(pkmn: Pokemon):
+def _sample_pokemon(pkmn: Pokemon, observed_behaviors: dict = None):
+    if observed_behaviors is None:
+        observed_behaviors = {}
+
     set_most_likely_hidden_power(pkmn)
 
     # 1: TeamDatasets is not emptied and `get_all_remaining_sets` returned at least one set
@@ -339,7 +407,12 @@ def _sample_pokemon(pkmn: Pokemon):
         if s.pkmn_set.set_makes_sense(pkmn) and smogon_set_makes_sense(s)
     ]
     if remaining_team_sets:
-        sampled_set = deepcopy(random.choice(remaining_team_sets).pkmn_set)
+        team_pkmn_sets = [s.pkmn_set for s in remaining_team_sets]
+        team_pkmn_sets = apply_context_filters(team_pkmn_sets, observed_behaviors)
+        sampled_set = deepcopy(random.choices(
+            team_pkmn_sets,
+            weights=[s.count for s in team_pkmn_sets]
+        )[0])
         moves = sample_pokemon_moveset_with_known_pkmn_set(pkmn, sampled_set)
         sampled_set = PredictedPokemonSet(
             pkmn_set=sampled_set,
@@ -352,6 +425,7 @@ def _sample_pokemon(pkmn: Pokemon):
     # Sample a SmogonSet and then repeat the same process as in 2 to get a moveset
     remaining_smogon_sets = SmogonSets.get_all_remaining_sets(pkmn)
     remaining_smogon_sets = get_filtered_sets(pkmn, remaining_smogon_sets)
+    remaining_smogon_sets = apply_context_filters(remaining_smogon_sets, observed_behaviors)
     if remaining_smogon_sets:
         sampled_smogon_set = deepcopy(
             random.choices(
@@ -473,9 +547,17 @@ def prepare_battles(battle: Battle, num_battles: int) -> list[(Battle, float)]:
         if battle_copy.mega_evolve_possible():
             sample_mega_evolution(battle_copy.opponent, index)
 
-        sample_pokemon(battle_copy.opponent.active)
+        observed_behaviors = battle_copy.opponent.observed_behaviors
+        if observed_behaviors:
+            logger.info("Context-aware sampling enabled with observations: {}".format(
+                ", ".join(k for k, v in observed_behaviors.items() if v)
+            ))
+        else:
+            logger.debug("No behavioral observations yet - using baseline predictions")
+
+        sample_pokemon(battle_copy.opponent.active, observed_behaviors)
         for pkmn in filter(lambda x: x.is_alive(), battle_copy.opponent.reserve):
-            sample_pokemon(pkmn)
+            sample_pokemon(pkmn, observed_behaviors)
 
         if battle.generation in constants.NO_TEAM_PREVIEW_GENS:
             populate_standardbattle_unrevealed_pkmn(battle_copy)
