@@ -14,12 +14,17 @@ from poke_engine import State as PokeEngineState, monte_carlo_tree_search, MctsR
 from fp.search.poke_engine_helpers import battle_to_poke_engine_state, poke_engine_get_damage_rolls
 from fp.helpers import type_effectiveness_modifier
 from data import all_move_json
+from fp.search.move_priors import get_move_priorities, should_strongly_consider_switching
+from fp.search.position_eval import get_position_metrics
+from fp.search.switch_logic import get_switch_recommendation
 
 logger = logging.getLogger(__name__)
 
 
 def select_move_from_mcts_results(mcts_results: list[(MctsResult, float, int)]) -> str:
     final_policy = {}
+    move_scores = {}
+
     for mcts_result, sample_chance, index in mcts_results:
         this_policy = max(mcts_result.side_one, key=lambda x: x.visits)
         logger.debug(
@@ -32,18 +37,52 @@ def select_move_from_mcts_results(mcts_results: list[(MctsResult, float, int)]) 
             )
         )
         for s1_option in mcts_result.side_one:
-            final_policy[s1_option.move_choice] = final_policy.get(
-                s1_option.move_choice, 0
-            ) + (sample_chance * (s1_option.visits / mcts_result.total_visits))
+            move_name = s1_option.move_choice
+            visit_percentage = s1_option.visits / mcts_result.total_visits
+            weighted_visit = sample_chance * visit_percentage
+
+            final_policy[move_name] = final_policy.get(move_name, 0) + weighted_visit
+
+            if move_name not in move_scores:
+                move_scores[move_name] = []
+            move_scores[move_name].append(visit_percentage)
 
     final_policy = sorted(final_policy.items(), key=lambda x: x[1], reverse=True)
 
-    # Consider all moves that are close to the best move
-    highest_percentage = final_policy[0][1]
+    if final_policy:
+        highest_percentage = final_policy[0][1]
+
+        if highest_percentage >= 0.9:
+            logger.info("HIGH CONFIDENCE: {} dominates with {:.1f}% - selecting immediately".format(
+                final_policy[0][0], highest_percentage * 100
+            ))
+            return final_policy[0][0]
+
+        move_variance = {}
+        for move_name, visits in move_scores.items():
+            if len(visits) > 1:
+                mean = sum(visits) / len(visits)
+                variance = sum((x - mean) ** 2 for x in visits) / len(visits)
+                move_variance[move_name] = variance
+
+        if move_variance:
+            avg_variance = sum(move_variance.values()) / len(move_variance)
+            if avg_variance < 0.01:
+                logger.info("LOW VARIANCE: Results are consistent across samples (avg var: {:.4f})".format(avg_variance))
+            else:
+                logger.info("HIGH VARIANCE: Results vary across samples (avg var: {:.4f}) - position uncertain".format(avg_variance))
+
     final_policy = [i for i in final_policy if i[1] >= highest_percentage * 0.75]
     logger.info("Best Moves (ranked):")
     for i, policy in enumerate(final_policy):
-        logger.info(f"  {i+1}. {policy[0]} - {round(policy[1] * 100, 2)}%")
+        move_name = policy[0]
+        percentage = policy[1]
+
+        variance_note = ""
+        if move_name in move_variance:
+            variance_note = " (variance: {:.3f})".format(move_variance[move_name])
+
+        logger.info(f"  {i+1}. {move_name} - {round(percentage * 100, 2)}%{variance_note}")
 
     choice = random.choices(final_policy, weights=[p[1] for p in final_policy])[0]
     return choice[0]
@@ -64,33 +103,50 @@ def calculate_position_criticality(battle: Battle) -> float:
     if battle.team_preview:
         return criticality
 
-    user_alive = sum(1 for p in [battle.user.active] + battle.user.reserve if p and p.hp > 0)
-    opp_alive = sum(1 for p in [battle.opponent.active] + battle.opponent.reserve if p and p.hp > 0)
+    try:
+        position_metrics = get_position_metrics(battle)
 
-    if user_alive <= 2:
-        criticality *= 2.0
-        logger.info("Endgame position detected (user has {} Pokemon) - increasing search time by 2x".format(user_alive))
-    elif user_alive <= 3:
-        criticality *= 1.5
+        user_alive = sum(1 for p in [battle.user.active] + battle.user.reserve if p and p.hp > 0)
+        opp_alive = sum(1 for p in [battle.opponent.active] + battle.opponent.reserve if p and p.hp > 0)
 
-    if opp_alive <= 2:
-        criticality *= 1.3
-
-    if battle.user.active and battle.user.active.max_hp > 0:
-        hp_percentage = battle.user.active.hp / battle.user.active.max_hp
-        if hp_percentage < 0.3:
+        if user_alive <= 2:
+            criticality *= 2.0
+            logger.info("Endgame position detected (user has {} Pokemon) - increasing search time by 2x".format(user_alive))
+        elif user_alive <= 3:
             criticality *= 1.5
-            logger.info("Low HP detected ({:.1f}%) - increasing search time by 1.5x".format(hp_percentage * 100))
 
-    if battle.opponent.active:
-        setup_moves = ['swordsdance', 'dragondance', 'nastyplot', 'quiverdance', 'calmmind', 'irondefense', 'agility', 'rockpolish', 'shellsmash', 'geomancy']
-        for move in battle.opponent.active.moves:
-            if move.name in setup_moves:
+        if opp_alive <= 2:
+            criticality *= 1.3
+
+        if battle.user.active and battle.user.active.max_hp > 0:
+            hp_percentage = battle.user.active.hp / battle.user.active.max_hp
+            if hp_percentage < 0.3:
                 criticality *= 1.5
-                logger.info("Opponent has setup move {} - increasing search time by 1.5x".format(move.name))
-                break
+                logger.info("Low HP detected ({:.1f}%) - increasing search time by 1.5x".format(hp_percentage * 100))
 
-    criticality = min(criticality, 3.0)
+        if position_metrics['opp_sweep_potential'] >= 0.7:
+            criticality *= 1.8
+            logger.info("High opponent sweep potential ({:.2f}) - increasing search time by 1.8x".format(
+                position_metrics['opp_sweep_potential']
+            ))
+
+        if not position_metrics['has_win_condition']:
+            criticality *= 1.3
+            logger.info("No clear win condition - increasing search time by 1.3x")
+
+        if position_metrics['momentum'] < 0.4:
+            criticality *= 1.2
+            logger.info("Losing momentum ({:.2f}) - increasing search time by 1.2x".format(
+                position_metrics['momentum']
+            ))
+
+        criticality = min(criticality, 3.0)
+
+    except Exception as e:
+        logger.debug("Error calculating position metrics: {}".format(e))
+        user_alive = sum(1 for p in [battle.user.active] + battle.user.reserve if p and p.hp > 0)
+        if user_alive <= 2:
+            criticality *= 2.0
 
     return criticality
 
@@ -224,6 +280,37 @@ def has_hazard_move(pkmn):
     return any(move.name in hazard_moves for move in pkmn.moves)
 
 
+def predict_opponent_lead(opp_team: list) -> str:
+    lead_scores = {}
+
+    for opp_pkmn in opp_team:
+        score = 0.0
+
+        if has_setup_move(opp_pkmn):
+            score += 20
+
+        if has_hazard_move(opp_pkmn):
+            score += 25
+
+        weather_setters = ['pelipper', 'torkoal', 'hippowdon', 'tyranitar', 'ninetalesalola', 'politoed']
+        if any(setter in opp_pkmn.name.lower() for setter in weather_setters):
+            score += 30
+            logger.debug("{} is weather setter - likely lead".format(opp_pkmn.name))
+
+        common_leads = ['landorus', 'heatran', 'ferrothorn', 'clefable', 'excadrill', 'garchomp', 'gliscor']
+        if any(lead in opp_pkmn.name.lower() for lead in common_leads):
+            score += 10
+
+        lead_scores[opp_pkmn.name] = score
+
+    if lead_scores:
+        predicted_lead = max(lead_scores.items(), key=lambda x: x[1])
+        logger.info("Predicted opponent lead: {} (confidence: {:.1f})".format(predicted_lead[0], predicted_lead[1]))
+        return predicted_lead[0]
+
+    return opp_team[0].name if opp_team else None
+
+
 def optimize_team_preview_order(battle: Battle) -> str:
     if not battle.team_preview:
         return None
@@ -234,26 +321,50 @@ def optimize_team_preview_order(battle: Battle) -> str:
     if not our_team or not opp_team:
         return None
 
+    predicted_opp_lead_name = predict_opponent_lead(opp_team)
+    predicted_opp_lead = next((p for p in opp_team if p.name == predicted_opp_lead_name), opp_team[0])
+
     lead_scores = {}
 
     for our_pkmn in our_team:
         score = 0.0
 
+        matchup_vs_predicted = calculate_matchup_score(our_pkmn, predicted_opp_lead)
+        score += matchup_vs_predicted * 2.0
+        logger.debug("{} vs predicted lead {}: {:.1f}".format(our_pkmn.name, predicted_opp_lead.name, matchup_vs_predicted))
+
         for opp_pkmn in opp_team:
-            matchup = calculate_matchup_score(our_pkmn, opp_pkmn)
-            score += matchup
+            if opp_pkmn.name != predicted_opp_lead_name:
+                matchup = calculate_matchup_score(our_pkmn, opp_pkmn)
+                score += matchup * 0.5
 
         if has_setup_move(our_pkmn):
-            score += 15
-            logger.info("{} has setup move - bonus +15".format(our_pkmn.name))
+            setup_bonus = 20 if matchup_vs_predicted >= 15 else 10
+            score += setup_bonus
+            logger.info("{} has setup move - bonus +{}".format(our_pkmn.name, setup_bonus))
 
         if has_hazard_move(our_pkmn):
-            score += 10
-            logger.info("{} has hazard move - bonus +10".format(our_pkmn.name))
+            score += 15
+            logger.info("{} has hazard move - bonus +15".format(our_pkmn.name))
+
+        weather_setters = ['pelipper', 'torkoal', 'hippowdon', 'tyranitar', 'ninetalesalola', 'politoed']
+        is_weather_setter = any(setter in our_pkmn.name.lower() for setter in weather_setters)
+        if is_weather_setter:
+            score += 12
+            logger.info("{} is weather setter - bonus +12".format(our_pkmn.name))
 
         avg_speed = sum(p.speed for p in our_team) / len(our_team)
-        if our_pkmn.speed > avg_speed:
-            score += 5
+        if our_pkmn.speed > avg_speed * 1.2:
+            score += 8
+        elif our_pkmn.speed > avg_speed:
+            score += 4
+
+        anti_lead_bonus = 0
+        if matchup_vs_predicted >= 20:
+            anti_lead_bonus = 15
+            logger.info("{} counters predicted lead - bonus +15".format(our_pkmn.name))
+
+        score += anti_lead_bonus
 
         lead_scores[our_pkmn.name] = score
         logger.info("Team Preview Score for {}: {:.1f}".format(our_pkmn.name, score))
@@ -311,6 +422,35 @@ def find_best_move(battle: Battle) -> str:
         if alive_reserves:
             logger.warning("RECOMMENDATION: Strongly consider switching to avoid OHKO")
         logger.warning("=" * 60)
+
+        search_time_per_battle = int(search_time_per_battle * 1.5)
+        logger.info("OHKO threat detected - boosting search time by 1.5x to {}ms for deeper switch exploration".format(
+            search_time_per_battle
+        ))
+
+    try:
+        move_priorities = get_move_priorities(battle)
+    except Exception as e:
+        logger.debug("Error getting move priorities: {}".format(e))
+
+    try:
+        switch_rec = get_switch_recommendation(battle)
+        if switch_rec['should_switch']:
+            logger.info("=" * 60)
+            logger.info("SWITCH RECOMMENDATION: {}".format(switch_rec['reason']))
+            logger.info("  Recommended: {} (score: {:.2f})".format(
+                switch_rec['pokemon_name'],
+                switch_rec['score']
+            ))
+            if 'switch_damage' in switch_rec:
+                logger.info("  Switch-in damage: {}-{} (safe: {})".format(
+                    switch_rec['switch_damage']['min'],
+                    switch_rec['switch_damage']['max'],
+                    switch_rec['switch_damage']['safe']
+                ))
+            logger.info("=" * 60)
+    except Exception as e:
+        logger.debug("Error getting switch recommendation: {}".format(e))
 
     logger.info("Searching for a move using MCTS...")
     logger.info(
