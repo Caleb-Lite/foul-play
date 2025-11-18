@@ -21,9 +21,19 @@ from fp.search.switch_logic import get_switch_recommendation
 logger = logging.getLogger(__name__)
 
 
-def select_move_from_mcts_results(mcts_results: list[(MctsResult, float, int)]) -> str:
+from fp.strategy.strategic_context import StrategicContext
+from fp.search.lookahead import evaluate_candidate_lines
+from fp.strategy.risk import MoveRiskProfile
+
+
+def select_move_from_mcts_results(
+    battle: Battle,
+    mcts_results: list[(MctsResult, float, int)],
+    strategic_context: StrategicContext | None = None,
+) -> tuple[str, dict]:
     final_policy = {}
     move_scores = {}
+    move_variance = {}
 
     for mcts_result, sample_chance, index in mcts_results:
         this_policy = max(mcts_result.side_one, key=lambda x: x.visits)
@@ -56,9 +66,9 @@ def select_move_from_mcts_results(mcts_results: list[(MctsResult, float, int)]) 
             logger.info("HIGH CONFIDENCE: {} dominates with {:.1f}% - selecting immediately".format(
                 final_policy[0][0], highest_percentage * 100
             ))
-            return final_policy[0][0]
+            policy_summary = {final_policy[0][0]: 1.0}
+            return final_policy[0][0], policy_summary
 
-        move_variance = {}
         for move_name, visits in move_scores.items():
             if len(visits) > 1:
                 mean = sum(visits) / len(visits)
@@ -73,6 +83,52 @@ def select_move_from_mcts_results(mcts_results: list[(MctsResult, float, int)]) 
                 logger.info("HIGH VARIANCE: Results vary across samples (avg var: {:.4f}) - position uncertain".format(avg_variance))
 
     final_policy = [i for i in final_policy if i[1] >= highest_percentage * 0.75]
+
+    position_metrics = None
+    risk_profiles: dict[str, MoveRiskProfile] | None = None
+    line_evaluations = None
+    if strategic_context:
+        position_metrics = strategic_context.last_position_metrics
+        if position_metrics is None:
+            position_metrics = get_position_metrics(battle)
+            strategic_context.update_position_metrics(position_metrics)
+        candidate_moves = [policy[0] for policy in final_policy]
+        risk_analyzer = strategic_context.risk_analyzer
+        missing_moves = [mv for mv in candidate_moves if mv not in risk_analyzer.turn_cache]
+        if missing_moves:
+            risk_analyzer.evaluate_moves(battle, position_metrics, missing_moves)
+        risk_profiles = {
+            mv: risk_analyzer.turn_cache.get(mv)
+            for mv in candidate_moves
+            if mv in risk_analyzer.turn_cache
+        }
+        opponent_profile = strategic_context.opponent_model.get_profile()
+        line_evaluations = evaluate_candidate_lines(
+            battle,
+            candidate_moves,
+            opponent_profile,
+            risk_profiles,
+            position_metrics,
+        )
+
+        adjusted_policy = []
+        for move_name, weight in final_policy:
+            adjustment = 1.0
+            if line_evaluations and move_name in line_evaluations:
+                adjustment += line_evaluations[move_name]
+            if risk_profiles and move_name in risk_profiles:
+                profile = risk_profiles[move_name]
+                momentum = position_metrics.get("momentum", 0.5)
+                if momentum > 0.6:
+                    adjustment *= max(0.4, 1.0 - profile.fail_chance)
+                elif momentum < 0.4:
+                    adjustment *= 1.0 + profile.expected_value / 150.0
+            adjusted_policy.append((move_name, max(weight * adjustment, 0.0)))
+
+        total = sum(weight for _, weight in adjusted_policy)
+        if total > 0:
+            final_policy = [(move, weight / total) for move, weight in adjusted_policy]
+
     logger.info("Best Moves (ranked):")
     for i, policy in enumerate(final_policy):
         move_name = policy[0]
@@ -84,8 +140,9 @@ def select_move_from_mcts_results(mcts_results: list[(MctsResult, float, int)]) 
 
         logger.info(f"  {i+1}. {move_name} - {round(percentage * 100, 2)}%{variance_note}")
 
+    policy_summary = {move: weight for move, weight in final_policy}
     choice = random.choices(final_policy, weights=[p[1] for p in final_policy])[0]
-    return choice[0]
+    return choice[0], policy_summary
 
 
 def get_result_from_mcts(state: str, search_time_ms: int, index: int) -> MctsResult:
@@ -97,14 +154,24 @@ def get_result_from_mcts(state: str, search_time_ms: int, index: int) -> MctsRes
     return res
 
 
-def calculate_position_criticality(battle: Battle) -> float:
+def calculate_position_criticality(battle: Battle, position_metrics: dict | None = None) -> float:
     criticality = 1.0
 
     if battle.team_preview:
         return criticality
 
     try:
-        position_metrics = get_position_metrics(battle)
+        if position_metrics is None:
+            if (
+                hasattr(battle, "strategic_context")
+                and battle.strategic_context
+                and battle.strategic_context.last_position_metrics
+            ):
+                position_metrics = battle.strategic_context.last_position_metrics
+            else:
+                position_metrics = get_position_metrics(battle)
+                if hasattr(battle, "strategic_context") and battle.strategic_context:
+                    battle.strategic_context.update_position_metrics(position_metrics)
 
         user_alive = sum(1 for p in [battle.user.active] + battle.user.reserve if p and p.hp > 0)
         opp_alive = sum(1 for p in [battle.opponent.active] + battle.opponent.reserve if p and p.hp > 0)
@@ -380,7 +447,12 @@ def optimize_team_preview_order(battle: Battle) -> str:
 
 
 def find_best_move(battle: Battle) -> str:
+    strategic_context = getattr(battle, "strategic_context", None)
     battle = deepcopy(battle)
+
+    if strategic_context is None:
+        strategic_context = StrategicContext()
+    battle.strategic_context = strategic_context
 
     if battle.team_preview:
         optimal_lead_index = optimize_team_preview_order(battle)
@@ -390,6 +462,24 @@ def find_best_move(battle: Battle) -> str:
 
         battle.user.active = battle.user.reserve.pop(0)
         battle.opponent.active = battle.opponent.reserve.pop(0)
+
+    battle.strategic_context.opponent_model.observe_turn(battle)
+    position_metrics = get_position_metrics(battle)
+    battle.strategic_context.update_position_metrics(position_metrics)
+    battle.strategic_context.risk_analyzer.evaluate_moves(battle, position_metrics)
+    if battle.strategic_context.risk_analyzer.turn_cache:
+        logger.info("Risk/Reward snapshot:")
+        ranked_risks = sorted(
+            battle.strategic_context.risk_analyzer.turn_cache.values(),
+            key=lambda p: p.expected_value,
+            reverse=True,
+        )
+        for profile in ranked_risks[:3]:
+            logger.info(
+                "  {} -> EV {:.1f}, fail {:.0%}, variance {:.2f}".format(
+                    profile.name, profile.expected_value, profile.fail_chance, profile.variance
+                )
+            )
 
     if battle.battle_type == BattleType.RANDOM_BATTLE:
         num_battles, search_time_per_battle = search_time_num_battles_randombattles(
@@ -428,11 +518,13 @@ def find_best_move(battle: Battle) -> str:
             search_time_per_battle
         ))
 
+    move_priorities = {}
     try:
         move_priorities = get_move_priorities(battle)
     except Exception as e:
         logger.debug("Error getting move priorities: {}".format(e))
 
+    switch_rec = None
     try:
         switch_rec = get_switch_recommendation(battle)
         if switch_rec['should_switch']:
@@ -452,6 +544,50 @@ def find_best_move(battle: Battle) -> str:
     except Exception as e:
         logger.debug("Error getting switch recommendation: {}".format(e))
 
+    def choose_policy_move():
+        preserve_list = position_metrics.get('win_conditions', {}).get('preserve', [])
+        if (
+            switch_rec
+            and switch_rec.get('should_switch')
+            and (
+                battle.user.active
+                and battle.user.active.name in preserve_list
+                or should_strongly_consider_switching(battle)
+            )
+        ):
+            return "switch {}".format(switch_rec['pokemon_name'])
+        if not move_priorities and battle.user.active and battle.user.active.moves:
+            return battle.user.active.moves[0].name
+        if not move_priorities:
+            return "struggle"
+
+        momentum = position_metrics.get('momentum', 0.5)
+
+        def score(item):
+            move_name, weight = item
+            profile = battle.strategic_context.risk_analyzer.turn_cache.get(move_name)
+            if profile:
+                if momentum > 0.6:
+                    return weight - profile.fail_chance
+                else:
+                    return weight + profile.expected_value / 150.0
+            return weight
+
+        return max(move_priorities.items(), key=score)[0]
+
+    if battle.strategic_context.time_manager.should_skip_deep_search(battle):
+        logger.warning("Time pressure detected - falling back to heuristic policy")
+        fallback_choice = choose_policy_move()
+        policy_summary = move_priorities if move_priorities else {fallback_choice: 1.0}
+        battle.strategic_context.experience_tracker.record_turn(
+            battle,
+            fallback_choice,
+            position_metrics,
+            policy_summary,
+            battle.strategic_context.risk_analyzer,
+        )
+        return fallback_choice
+
     logger.info("Searching for a move using MCTS...")
     logger.info(
         "Sampling {} battles at {}ms each".format(num_battles, search_time_per_battle)
@@ -468,6 +604,19 @@ def find_best_move(battle: Battle) -> str:
             futures.append((fut, chance, index))
 
     mcts_results = [(fut.result(), chance, index) for (fut, chance, index) in futures]
-    choice = select_move_from_mcts_results(mcts_results)
+    choice, policy_summary = select_move_from_mcts_results(
+        battle,
+        mcts_results,
+        battle.strategic_context,
+    )
     logger.info("Choice: {}".format(choice))
+
+    battle.strategic_context.experience_tracker.record_turn(
+        battle,
+        choice,
+        position_metrics,
+        policy_summary,
+        battle.strategic_context.risk_analyzer,
+    )
+
     return choice

@@ -7,6 +7,7 @@ from copy import deepcopy
 from config import FoulPlayConfig, init_logging, BotModes
 
 from teams import load_team
+from teams.meta_selector import MetaTeamSelector
 from fp.run_battle import pokemon_battle
 from fp.websocket_client import PSWebsocketClient
 
@@ -64,9 +65,14 @@ async def run_foul_play():
     losses = 0
     team_file_name = "None"
     team_dict = None
+    meta_selector = MetaTeamSelector()
     while True:
         if FoulPlayConfig.requires_team():
-            team_packed, team_dict, team_file_name = load_team(FoulPlayConfig.team_name)
+            team_packed, team_dict, team_file_name = load_team(
+                FoulPlayConfig.team_name,
+                FoulPlayConfig.pokemon_format,
+                meta_selector,
+            )
             await ps_websocket_client.update_team(team_packed)
         else:
             await ps_websocket_client.update_team("None")
@@ -88,12 +94,17 @@ async def run_foul_play():
         winner = await pokemon_battle(
             ps_websocket_client, FoulPlayConfig.pokemon_format, team_dict
         )
-        if winner == FoulPlayConfig.username:
+        did_win = winner == FoulPlayConfig.username
+        if did_win:
             wins += 1
             logger.info("Won with team: {}".format(team_file_name))
         else:
             losses += 1
             logger.info("Lost with team: {}".format(team_file_name))
+        if FoulPlayConfig.requires_team():
+            meta_selector.record_result(
+                team_file_name, FoulPlayConfig.pokemon_format, did_win
+            )
 
         logger.info("W: {}\tL: {}".format(wins, losses))
         check_dictionaries_are_unmodified(original_pokedex, original_move_json)

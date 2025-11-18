@@ -1,8 +1,9 @@
 from collections import defaultdict
 from collections import namedtuple
 
-import constants
 import logging
+
+import constants
 
 from data import all_move_json
 from data import pokedex
@@ -12,6 +13,7 @@ from fp.helpers import normalize_name
 from fp.helpers import calculate_stats
 
 from fp.helpers import POKEMON_TYPE_INDICES
+from fp.strategy import StrategicContext
 
 
 logger = logging.getLogger(__name__)
@@ -64,6 +66,7 @@ class Battle:
         self.battle_tag = battle_tag
         self.user = Battler()
         self.opponent = Battler()
+        self.strategic_context = StrategicContext()
         self.weather = None
         self.weather_turns_remaining = -1
         self.weather_source = ""
@@ -673,6 +676,14 @@ class Pokemon:
             constants.SPEED: boost_multiplier_lookup[self.boosts[constants.SPEED]]
             * self.stats[constants.SPEED],
         }
+
+    @property
+    def speed(self):
+        return self.stats.get(constants.SPEED, 0)
+
+    @speed.setter
+    def speed(self, value):
+        self.stats[constants.SPEED] = value
 
     @classmethod
     def extract_nickname_from_pokemonshowdown_string(cls, ps_string):

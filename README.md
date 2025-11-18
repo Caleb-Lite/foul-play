@@ -71,6 +71,11 @@ docker run --rm --network host foul-play:latest \
 --pokemon-format gen9randombattle
 ```
 
+## Advanced Strategy Features
+
+- **Meta-aware team selection** – set `--team-name auto` (or `TEAM_NAME=auto`) to let the bot rotate through the `teams/` pool. The selector records results in `data/team_meta_state.json` and favors lineups with higher win rates in the current ladder format while still exploring new archetypes.
+- **Experience logging** – every decision, risk profile, and evaluation snapshot is appended to `data/experience_log.jsonl`. Use this dataset to train value/policy networks or to review blunders from high-ladder runs.
+
 ## Engine
 
 This project uses [poke-engine](https://github.com/pmariglia/poke-engine) to search through battles.
