@@ -73,7 +73,7 @@ class _FoulPlayConfig:
     bot_mode: BotModes
     pokemon_format: str = ""
     smogon_stats: str = None
-    search_time_ms: int
+    search_time_ms: int = 100
     parallelism: int
     run_count: int
     team_name: str

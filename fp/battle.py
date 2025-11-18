@@ -14,12 +14,12 @@ from fp.helpers import calculate_stats
 
 from fp.helpers import POKEMON_TYPE_INDICES
 from fp.strategy import StrategicContext
+from fp.shared_types import LastUsedMove
 
 
 logger = logging.getLogger(__name__)
 
 
-LastUsedMove = namedtuple("LastUsedMove", ["pokemon_name", "move", "turn"])
 DamageDealt = namedtuple(
     "DamageDealt", ["attacker", "defender", "move", "percent_damage", "crit"]
 )

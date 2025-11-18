@@ -45,6 +45,9 @@ class WinConditionTracker:
         self.backup: List[WinCondition] = []
         self.do_not_sack: List[str] = []
         self.critical_targets: List[str] = []
+        self.predicted_opponent_tera: Dict[str, List[tuple[str, float]]] = {}
+        self.predicted_threats: Dict[str, float] = {}
+        self.predicted_leads: Dict[str, float] = {}
 
     def reset(self) -> None:
         self.__init__()
@@ -118,6 +121,11 @@ class WinConditionTracker:
             "backup": [wc.__dict__ for wc in self.backup],
             "preserve": self.do_not_sack,
             "targets": self.critical_targets,
+            "predictions": {
+                "opponent_tera": self.predicted_opponent_tera,
+                "opponent_threats": self.predicted_threats,
+                "opponent_leads": self.predicted_leads,
+            },
         }
 
     def update_from_metrics(self, metrics: Optional[Dict]) -> None:
@@ -128,6 +136,22 @@ class WinConditionTracker:
         if not wincon_info:
             return
         self.do_not_sack = wincon_info.get("preserve", self.do_not_sack)
+
+    def ingest_predictions(
+        self,
+        tera_predictions: Optional[Dict[str, List[tuple[str, float]]]],
+        threat_scores: Optional[Dict[str, float]],
+        lead_probabilities: Optional[Dict[str, float]] = None,
+    ) -> None:
+        if tera_predictions:
+            self.predicted_opponent_tera = tera_predictions
+        if threat_scores:
+            self.predicted_threats = threat_scores
+            for name, score in threat_scores.items():
+                if score > 0.4 and name not in self.critical_targets:
+                    self.critical_targets.append(name)
+        if lead_probabilities:
+            self.predicted_leads = lead_probabilities
 
     def evaluate(self, battle: "Battle") -> Dict:
         return self.analyze_battle(battle)

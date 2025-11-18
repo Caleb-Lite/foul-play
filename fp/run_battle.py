@@ -13,6 +13,7 @@ from fp.battle import LastUsedMove, Pokemon, Battle
 from fp.battle_modifier import async_update_battle, process_battle_updates
 from fp.helpers import normalize_name
 from fp.search.main import find_best_move
+from fp.strategy.scouting import UsageScout
 
 from fp.websocket_client import PSWebsocketClient
 
@@ -384,6 +385,19 @@ async def start_standard_battle(
                 FoulPlayConfig.smogon_stats or pokemon_battle_type, unique_pkmn_names
             )
             TeamDatasets.initialize(pokemon_battle_type, unique_pkmn_names)
+
+        try:
+            scout = UsageScout()
+            preview_report = scout.build_preview_report(battle)
+            if battle.strategic_context:
+                battle.strategic_context.preview_report = preview_report
+                battle.strategic_context.wincon_tracker.ingest_predictions(
+                    preview_report.get("tera"),
+                    preview_report.get("threats"),
+                    preview_report.get("leads"),
+                )
+        except Exception as exc:
+            logger.debug("Unable to build scouting report: {}".format(exc))
 
         await handle_team_preview(battle, ps_websocket_client)
 

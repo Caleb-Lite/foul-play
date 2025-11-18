@@ -17,6 +17,7 @@ from data import all_move_json
 from fp.search.move_priors import get_move_priorities, should_strongly_consider_switching
 from fp.search.position_eval import get_position_metrics
 from fp.search.switch_logic import get_switch_recommendation
+from fp.strategy.scouting import UsageScout
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +111,9 @@ def select_move_from_mcts_results(
             risk_profiles,
             position_metrics,
         )
+        double_switch_bias = opponent_profile.get("double_switch_success", 0.0)
+        sack_bias = opponent_profile.get("sack_timing", 0.0)
+        opponent_tera_turn = opponent_profile.get("tera_turn")
 
         adjusted_policy = []
         for move_name, weight in final_policy:
@@ -123,6 +127,15 @@ def select_move_from_mcts_results(
                     adjustment *= max(0.4, 1.0 - profile.fail_chance)
                 elif momentum < 0.4:
                     adjustment *= 1.0 + profile.expected_value / 150.0
+                if profile.description == "finisher":
+                    adjustment *= 1.0 + sack_bias * 0.3
+            if move_name.startswith("switch"):
+                adjustment *= max(0.2, 1.0 - double_switch_bias * 0.5)
+            if move_name.endswith("-tera"):
+                if opponent_tera_turn is None:
+                    adjustment *= 0.9
+                else:
+                    adjustment *= 1.1
             adjusted_policy.append((move_name, max(weight * adjustment, 0.0)))
 
         total = sum(weight for _, weight in adjusted_policy)
@@ -226,9 +239,9 @@ def search_time_num_battles_randombattles(battle):
     opponent_active_num_moves = len(battle.opponent.active.moves)
     in_time_pressure = battle.time_remaining is not None and battle.time_remaining <= 60
 
-    base_time = FoulPlayConfig.search_time_ms
     criticality = calculate_position_criticality(battle)
-    adjusted_time = int(base_time * criticality)
+    time_manager = battle.strategic_context.time_manager
+    adjusted_time = time_manager.allocate_search_time(battle, criticality)
 
     if (
         revealed_pkmn <= 3
@@ -246,9 +259,9 @@ def search_time_num_battles_standard_battle(battle):
     opponent_active_num_moves = len(battle.opponent.active.moves)
     in_time_pressure = battle.time_remaining is not None and battle.time_remaining <= 60
 
-    base_time = FoulPlayConfig.search_time_ms
     criticality = calculate_position_criticality(battle)
-    adjusted_time = int(base_time * criticality)
+    time_manager = battle.strategic_context.time_manager
+    adjusted_time = time_manager.allocate_search_time(battle, criticality)
 
     if (
         battle.team_preview
@@ -388,51 +401,54 @@ def optimize_team_preview_order(battle: Battle) -> str:
     if not our_team or not opp_team:
         return None
 
-    predicted_opp_lead_name = predict_opponent_lead(opp_team)
-    predicted_opp_lead = next((p for p in opp_team if p.name == predicted_opp_lead_name), opp_team[0])
+    scout_report = getattr(battle.strategic_context, "preview_report", None)
+    if scout_report is None:
+        try:
+            scout_report = UsageScout().build_preview_report(battle)
+            if battle.strategic_context:
+                battle.strategic_context.preview_report = scout_report
+        except Exception as exc:
+            logger.debug("Unable to compute usage scouting report: {}".format(exc))
+            scout_report = {}
+
+    lead_probs = scout_report.get("leads", {}) if scout_report else {}
+    threat_scores = scout_report.get("threats", {}) if scout_report else {}
+
+    if lead_probs:
+        predicted_opp_lead_name = max(lead_probs.items(), key=lambda x: x[1])[0]
+        logger.info(
+            "Predicted opponent lead: {} ({:.1f}%)".format(
+                predicted_opp_lead_name, lead_probs[predicted_opp_lead_name] * 100
+            )
+        )
+        logger.info(
+            "Lead distribution: {}".format(
+                ", ".join(
+                    "{}:{:.0f}%".format(name, prob * 100)
+                    for name, prob in sorted(lead_probs.items(), key=lambda x: x[1], reverse=True)
+                )
+            )
+        )
+    else:
+        predicted_opp_lead_name = predict_opponent_lead(opp_team)
+
+    weight_map = lead_probs or {
+        pokemon.name: 1.0 / len([p for p in opp_team if p]) for pokemon in opp_team if pokemon
+    }
 
     lead_scores = {}
-
     for our_pkmn in our_team:
         score = 0.0
-
-        matchup_vs_predicted = calculate_matchup_score(our_pkmn, predicted_opp_lead)
-        score += matchup_vs_predicted * 2.0
-        logger.debug("{} vs predicted lead {}: {:.1f}".format(our_pkmn.name, predicted_opp_lead.name, matchup_vs_predicted))
-
         for opp_pkmn in opp_team:
-            if opp_pkmn.name != predicted_opp_lead_name:
-                matchup = calculate_matchup_score(our_pkmn, opp_pkmn)
-                score += matchup * 0.5
-
-        if has_setup_move(our_pkmn):
-            setup_bonus = 20 if matchup_vs_predicted >= 15 else 10
-            score += setup_bonus
-            logger.info("{} has setup move - bonus +{}".format(our_pkmn.name, setup_bonus))
-
-        if has_hazard_move(our_pkmn):
-            score += 15
-            logger.info("{} has hazard move - bonus +15".format(our_pkmn.name))
-
-        weather_setters = ['pelipper', 'torkoal', 'hippowdon', 'tyranitar', 'ninetalesalola', 'politoed']
-        is_weather_setter = any(setter in our_pkmn.name.lower() for setter in weather_setters)
-        if is_weather_setter:
-            score += 12
-            logger.info("{} is weather setter - bonus +12".format(our_pkmn.name))
-
-        avg_speed = sum(p.speed for p in our_team) / len(our_team)
-        if our_pkmn.speed > avg_speed * 1.2:
-            score += 8
-        elif our_pkmn.speed > avg_speed:
-            score += 4
-
-        anti_lead_bonus = 0
-        if matchup_vs_predicted >= 20:
-            anti_lead_bonus = 15
-            logger.info("{} counters predicted lead - bonus +15".format(our_pkmn.name))
-
-        score += anti_lead_bonus
-
+            if not opp_pkmn:
+                continue
+            weight = weight_map.get(opp_pkmn.name, 0.0)
+            matchup = calculate_matchup_score(our_pkmn, opp_pkmn)
+            score += matchup * weight
+            threat = threat_scores.get(opp_pkmn.name, 0.0)
+            if threat:
+                score += threat * matchup * 0.1
+        score += our_pkmn.speed / 100.0
         lead_scores[our_pkmn.name] = score
         logger.info("Team Preview Score for {}: {:.1f}".format(our_pkmn.name, score))
 
@@ -475,9 +491,18 @@ def find_best_move(battle: Battle) -> str:
             reverse=True,
         )
         for profile in ranked_risks[:3]:
+            hazard_note = ""
+            if profile.hazard_cost > 0:
+                hazard_note = ", hazard -{:.0f}".format(profile.hazard_cost)
             logger.info(
-                "  {} -> EV {:.1f}, fail {:.0%}, variance {:.2f}".format(
-                    profile.name, profile.expected_value, profile.fail_chance, profile.variance
+                "  {} -> EV {:.1f} (range {:.0f}-{:.0f}), fail {:.0%}, variance {:.2f}{}".format(
+                    profile.name,
+                    profile.expected_value,
+                    profile.min_damage,
+                    profile.max_damage,
+                    profile.fail_chance,
+                    profile.variance,
+                    hazard_note,
                 )
             )
 

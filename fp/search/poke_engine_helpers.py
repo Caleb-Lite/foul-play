@@ -1,8 +1,11 @@
+from __future__ import annotations
+
 import logging
+from typing import TYPE_CHECKING
 
 import constants
 from data import pokedex
-from fp.battle import Battle, Pokemon, Battler, LastUsedMove
+from fp.shared_types import LastUsedMove
 
 from poke_engine import (
     State as PokeEngineState,
@@ -13,6 +16,9 @@ from poke_engine import (
     Move as PokeEngineMove,
     calculate_damage,
 )
+
+if TYPE_CHECKING:
+    from fp.battle import Battle, Pokemon, Battler
 
 logger = logging.getLogger(__name__)
 

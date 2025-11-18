@@ -20,6 +20,7 @@ class StrategicContext:
     experience_tracker: ExperienceTracker = field(default_factory=ExperienceTracker)
     time_manager: TimeManager = field(default_factory=TimeManager)
     last_position_metrics: Optional[Dict] = None
+    preview_report: Optional[Dict] = None
 
     def reset_for_new_battle(self) -> None:
         self.opponent_model.reset()
@@ -28,6 +29,7 @@ class StrategicContext:
         self.experience_tracker.reset()
         self.time_manager.reset()
         self.last_position_metrics = None
+        self.preview_report = None
 
     def update_position_metrics(self, metrics: Dict) -> None:
         self.last_position_metrics = metrics
